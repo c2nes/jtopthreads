@@ -20,13 +20,23 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/bits"
 	"os"
 	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/c2nes/jtopthreads/internal/proc"
 )
+
+// Combined output of jstack with data collected from /proc.
+type StackDump struct {
+	Text      string
+	ProcStats map[int]string
+	Uptime    time.Duration
+}
 
 type Thread struct {
 	Header  string
@@ -34,26 +44,26 @@ type Thread struct {
 	CPU     time.Duration
 	Elapsed time.Duration
 	TID     string
-	NID     string
+	NID     int
 	Stack   string
 }
 
-func getHeaderField(line string, name string) (string, error) {
+func getHeaderField(line string, name string) string {
 	startMarker := name + "="
 	startIdx := strings.Index(line, startMarker)
 	if startIdx < 0 {
-		return "", fmt.Errorf("field not found: %s", name)
+		return ""
 	}
 
 	suffix := line[startIdx+len(startMarker):]
 	endIdx := strings.Index(suffix, " ")
 	if endIdx < 0 {
-		return suffix, nil
+		endIdx = len(suffix)
 	}
-	return suffix[:endIdx], nil
+	return suffix[:endIdx]
 }
 
-func parseThread(lines []string) (*Thread, error) {
+func (dump *StackDump) parseThread(lines []string) (*Thread, error) {
 	header := lines[0]
 	stack := strings.Join(lines[1:], "\n")
 
@@ -65,35 +75,59 @@ func parseThread(lines []string) (*Thread, error) {
 	}
 	name := header[startName:endName]
 
-	// Extract other header fields
-	cpuString, err := getHeaderField(header, "cpu")
-	if err != nil {
-		return nil, err
+	tid := getHeaderField(header, "tid")
+	if tid == "" {
+		return nil, errors.New("tid= field missing from header")
 	}
 
-	cpu, err := time.ParseDuration(cpuString)
-	if err != nil {
-		return nil, err
+	nidString := getHeaderField(header, "nid")
+	if nidString == "" {
+		return nil, errors.New("nid= field missing from header")
 	}
 
-	elapsedString, err := getHeaderField(header, "elapsed")
+	nid64, err := strconv.ParseInt(nidString, 0, bits.UintSize)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to parse nid: %w", err)
+	}
+	nid := int(nid64)
+
+	// Parse prop data for thread if we have it
+	var stat *proc.ProcStat
+	if procString, ok := dump.ProcStats[nid]; ok {
+		stat, err = proc.Parse(procString)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing /proc/[pid]/task/[tid]/stat: %w", err)
+		}
 	}
 
-	elapsed, err := time.ParseDuration(elapsedString)
-	if err != nil {
-		return nil, err
+	// In recent Java versions stack dumps include CPU and elapsed time. We use
+	// this data if it is available, but will fall back to using data from /proc
+	// (again, if available).
+
+	var cpu, elapsed time.Duration
+
+	cpuString := getHeaderField(header, "cpu")
+	if cpuString != "" {
+		cpu, err = time.ParseDuration(cpuString)
+		if err != nil {
+			return nil, err
+		}
+	} else if stat != nil {
+		cpu = proc.Duration(stat.Utime + stat.Stime)
+	} else {
+		cpu = 0 * time.Second
 	}
 
-	tid, err := getHeaderField(header, "tid")
-	if err != nil {
-		return nil, err
-	}
-
-	nid, err := getHeaderField(header, "nid")
-	if err != nil {
-		return nil, err
+	elapsedString := getHeaderField(header, "elapsed")
+	if elapsedString != "" {
+		elapsed, err = time.ParseDuration(elapsedString)
+		if err != nil {
+			return nil, err
+		}
+	} else if stat != nil {
+		elapsed = dump.Uptime - proc.Duration(stat.Starttime)
+	} else {
+		elapsed = 0 * time.Second
 	}
 
 	thread := &Thread{
@@ -109,17 +143,17 @@ func parseThread(lines []string) (*Thread, error) {
 	return thread, nil
 }
 
-func ParseThreads(text string) (map[string]*Thread, error) {
+func (dump *StackDump) ParseThreads() (map[string]*Thread, error) {
 	threads := make(map[string]*Thread)
 	var thread []string
-	for _, l := range strings.Split(text, "\n") {
+	for _, l := range strings.Split(dump.Text, "\n") {
 		if len(l) > 0 && (l[0] == ' ' || l[0] == '\t') {
 			if len(thread) > 0 {
 				thread = append(thread, l)
 			}
 		} else {
 			if len(thread) > 0 {
-				parsed, err := parseThread(thread)
+				parsed, err := dump.parseThread(thread)
 				if err != nil {
 					return nil, err
 				}
@@ -132,7 +166,7 @@ func ParseThreads(text string) (map[string]*Thread, error) {
 		}
 	}
 	if len(thread) > 0 {
-		parsed, err := parseThread(thread)
+		parsed, err := dump.parseThread(thread)
 		if err != nil {
 			return nil, err
 		}
@@ -151,20 +185,22 @@ func printHeader(cpuFrac float64, header string) {
 	}
 }
 
-func printTopThreads(dump0, dump1 string, n int, summary bool) error {
-	threads0, err := ParseThreads(dump0)
+func printTopThreads(dump0, dump1 *StackDump, n int, summary bool) error {
+	threads0, err := dump0.ParseThreads()
 	if err != nil {
 		panic(err)
 	}
 
-	threads1, err := ParseThreads(dump1)
+	threads1, err := dump1.ParseThreads()
 	if err != nil {
 		panic(err)
 	}
 
 	type withCPUFrac struct {
-		frac   float64
-		thread *Thread
+		frac    float64
+		thread  *Thread
+		cpu     time.Duration
+		elapsed time.Duration
 	}
 
 	var totalCPU time.Duration
@@ -188,7 +224,7 @@ func printTopThreads(dump0, dump1 string, n int, summary bool) error {
 		}
 
 		frac := float64(cpu) / float64(elapsed)
-		top = append(top, &withCPUFrac{frac, t1})
+		top = append(top, &withCPUFrac{frac, t1, cpu, elapsed})
 	}
 
 	// Sort by CPU time in descending order
@@ -199,7 +235,7 @@ func printTopThreads(dump0, dump1 string, n int, summary bool) error {
 		return top[i].frac > top[j].frac
 	})
 
-	if n < 0 {
+	if n <= 0 {
 		n = len(top)
 	}
 
@@ -243,35 +279,135 @@ func parseJavaPID(s string) (int, error) {
 	return 0, fmt.Errorf("no process found matching \"%s\"", s)
 }
 
-func jstack(pid int) (string, error) {
+func collectProcStats(pid int) (map[int]string, error) {
+	bytes, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	tasks, err := ioutil.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	res := make(map[int]string)
+	res[pid] = string(bytes)
+
+	// From proc(5), on /proc/[pid]/task
+	//
+	// "This is a directory that contains one subdirectory for each thread in
+	//  the process.  The name of each subdirectory is the numerical thread ID
+	//  ([tid]) of the thread (see gettid(2))."
+	for _, task := range tasks {
+		tid, err := strconv.Atoi(task.Name())
+		// Ignore any invalid directory entries
+		if err != nil {
+			continue
+		}
+
+		// We already read this one
+		if tid == pid {
+			continue
+		}
+
+		bytes, err := ioutil.ReadFile(fmt.Sprintf("/proc/%d/task/%d/stat", pid, tid))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			} else {
+				return nil, err
+			}
+		}
+		res[tid] = string(bytes)
+	}
+
+	return res, nil
+}
+
+func readProcUptime() (time.Duration, error) {
+	v, err := ioutil.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0, err
+	}
+
+	var up, idle float64
+	_, err = fmt.Sscanf(string(v), "%f %f", &up, &idle)
+	if err != nil {
+		return 0, err
+	}
+
+	return time.Duration(up * float64(time.Second)), nil
+}
+
+func jstack(pid int) (*StackDump, error) {
+	// Read /proc/uptime so we can calculate elapsed process time
+	uptime, err := readProcUptime()
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
+
+	// Collect process stats
+	procResCh := make(chan map[int]string, 1)
+	procErrCh := make(chan error, 1)
+	go func() {
+		res, err := collectProcStats(pid)
+		procResCh <- res
+		procErrCh <- err
+	}()
+
 	cmd := exec.Command("jstack", strconv.Itoa(pid))
 	out, err := cmd.CombinedOutput()
+	// Wait for go routine to complete before returning any errors
+	procErr := <-procErrCh
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return string(out), nil
+	if procErr != nil {
+		return nil, procErr
+	}
+	return &StackDump{string(out), <-procResCh, uptime}, nil
 }
 
 func main() {
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		usage := "usage: %s [flags] [stack0 stack1 | pid | name]\n"
-		fmt.Fprintf(out, usage, os.Args[0])
+		usage := "usage: %s [options] <stack-file> [stack-file]\n"
+		usage += "   or: %s [options] [-sample <duration>] <pid | main-class>\n\n"
+		fmt.Fprintf(out, usage, os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 	}
 
-	topN := -1
-	duration := 5 * time.Second
+	usageError := func(format string, a ...interface{}) {
+		fmt.Fprintf(os.Stderr, "error: "+format, a...)
+		fmt.Fprint(os.Stderr, "\n\n")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	topN := 0
+	duration := time.Duration(0)
 	summary := false
 
 	flag.IntVar(&topN, "n", topN, "limit output to the top `N` threads")
-	flag.DurationVar(&duration, "d", duration, "sample duration")
+	flag.DurationVar(&duration, "sample", duration, "sample process for `duration`")
 	flag.BoolVar(&summary, "summary", summary, "omit stacks")
 	flag.Parse()
 
-	var dump0, dump1 string
+	var dump0, dump1 *StackDump
 
 	if flag.NArg() == 2 {
+		if duration > 0 {
+			usageError("-sample not supported with file arguments")
+		}
+
 		bytes0, err := ioutil.ReadFile(flag.Arg(0))
 		if err != nil {
 			log.Fatal(err)
@@ -282,46 +418,65 @@ func main() {
 			log.Fatal(err)
 		}
 
-		dump0 = string(bytes0)
-		dump1 = string(bytes1)
+		dump0 = &StackDump{Text: string(bytes0)}
+		dump1 = &StackDump{Text: string(bytes1)}
 	} else if flag.NArg() == 1 {
-		pid, err := parseJavaPID(flag.Arg(0))
-		if err != nil {
-			log.Fatal(err)
+		arg := flag.Arg(0)
+
+		// A single argument can be a file, pid or main-class. Process as a file
+		// if a matching file exists, otherwise assume the arg is a pid/main-class.
+		if _, err := os.Stat(arg); err == nil {
+			if duration > 0 {
+				usageError("-sample not supported with file argument")
+			}
+
+			bytes1, err := ioutil.ReadFile(arg)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			dump0 = &StackDump{}
+			dump1 = &StackDump{Text: string(bytes1)}
+		} else {
+			pid, err := parseJavaPID(arg)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			ch0 := make(chan *StackDump)
+			go func() {
+				dump, err := jstack(pid)
+				if err != nil {
+					log.Fatal(err)
+				}
+				ch0 <- dump
+			}()
+
+			if duration > 0 {
+				ch1 := make(chan *StackDump)
+				go func() {
+					time.Sleep(duration)
+					dump, err := jstack(pid)
+					if err != nil {
+						log.Fatal(err)
+					}
+					ch1 <- dump
+				}()
+
+				dump0 = <-ch0
+				dump1 = <-ch1
+			} else {
+				dump0 = &StackDump{}
+				dump1 = <-ch0
+			}
 		}
-
-		ch0 := make(chan string)
-		go func() {
-			dump, err := jstack(pid)
-			if err != nil {
-				log.Fatal(err)
-			}
-			ch0 <- dump
-		}()
-
-		ch1 := make(chan string)
-		go func() {
-			time.Sleep(duration)
-			dump, err := jstack(pid)
-			if err != nil {
-				log.Fatal(err)
-			}
-			ch1 <- dump
-		}()
-
-		dump0 = <-ch0
-		dump1 = <-ch1
+	} else if flag.NArg() < 1 {
+		usageError("argument missing")
 	} else {
-		fmt.Fprint(os.Stderr, "invalid arguments\n\n")
-		flag.Usage()
-		os.Exit(1)
+		usageError("too many arguments")
 	}
 
 	if err := printTopThreads(dump0, dump1, topN, summary); err != nil {
 		log.Fatal(err)
 	}
-
-	// TODO: Add option for "since process start"
-	// TODO: Add option to read data from /proc
-	// TODO: Make single dump mode the default
 }

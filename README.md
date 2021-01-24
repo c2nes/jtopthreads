@@ -154,5 +154,4 @@ $ jtopthreads -n 3 net.qrono.server.Main
 
 ## Supported Platforms
 
-`jtopthreads` has only been tested with HotSpot. It supports Java 8 on Linux and Java 11+ on other platforms.
-
+`jtopthreads` has only been tested with HotSpot. It supports Java 8 on Linux (live-capture only) and Java 11+ on other platforms. Analyzing previously captured `jstack` output is not supported on Java 8 due to the need to augment these pre-Java 11 captures with CPU usage data collected from `/proc`.
